@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -15,29 +16,44 @@ import (
 	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
-func main() {
-	var members = flag.Int("members", 100, "how many ring members to simulate")
-	flag.Parse()
+type config struct {
+	members               int
+	broadcastCount        int
+	broadcastInterval     int
+	heartbeatInterval     int
+	broadcastMessageLimit int
+	broadcastOldestFirst  bool
+}
 
-	broadcastInterval := 200 * time.Millisecond
-	heartbeatInterval := 5 * time.Second
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	c := &config{}
+
+	flag.IntVar(&c.members, "members", 100, "how many ring members to simulate")
+	flag.IntVar(&c.broadcastCount, "broadcast-count", 4, "the number of members to broadcast to each interval")
+	flag.IntVar(&c.broadcastInterval, "broadcast-interval", 200, "ms between broadcasts")
+	flag.IntVar(&c.heartbeatInterval, "heartbeat-interval", 5000, "ms between heartbeats")
+	flag.BoolVar(&c.broadcastOldestFirst, "broadcast-oldest-first", false, "whether to send the oldest updates first")
+	flag.IntVar(&c.broadcastMessageLimit, "broadcast-message-limit", -1, "the number of messages allowed per broadcast. if below zero, no limit")
+	flag.Parse()
 
 	close := make(chan interface{})
 
 	var r ring
-	r.members = make([]chan []update, *members)
+	r.members = make([]chan []update, c.members)
 
-	for index := 0; index < *members; index++ {
+	for index := 0; index < c.members; index++ {
 		c := make(chan []update, len(r.members))
 		r.members[index] = c
 	}
 
-	s := newStats(*members)
+	s := newStats(c.members)
 
 	var wg sync.WaitGroup
-	for index := 0; index < *members; index++ {
+	for index := 0; index < c.members; index++ {
 		wg.Add(1)
-		go member(r, index, broadcastInterval, heartbeatInterval, r.members[index], close, s)
+		go member(r, c, index, r.members[index], close, s)
 	}
 
 	go s.run(5 * time.Second)
@@ -54,11 +70,44 @@ type update struct {
 	heartbeat time.Time
 }
 
+type updates []update
+
+// Len is the number of elements in the collection.
+func (u updates) Len() int {
+	return len(u)
+}
+
+// Less reports whether the element with index i
+// must sort before the element with index j.
+//
+// If both Less(i, j) and Less(j, i) are false,
+// then the elements at index i and j are considered equal.
+// Sort may place equal elements in any order in the final result,
+// while Stable preserves the original input order of equal elements.
+//
+// Less must describe a transitive ordering:
+//  - if both Less(i, j) and Less(j, k) are true, then Less(i, k) must be true as well.
+//  - if both Less(i, j) and Less(j, k) are false, then Less(i, k) must be false as well.
+//
+// Note that floating-point comparison (the < operator on float32 or float64 values)
+// is not a transitive ordering when not-a-number (NaN) values are involved.
+// See Float64Slice.Less for a correct implementation for floating-point values.
+func (u updates) Less(i int, j int) bool {
+	return u[i].heartbeat.Before(u[j].heartbeat)
+}
+
+// Swap swaps the elements with indexes i and j.
+func (u updates) Swap(i int, j int) {
+	temp := u[i]
+	u[i] = u[j]
+	u[j] = temp
+}
+
 type ring struct {
 	members []chan []update
 }
 
-func member(r ring, index int, broadcastInterval, heartbeatInterval time.Duration, input <-chan []update, close <-chan (interface{}), s *stats) {
+func member(r ring, c *config, index int, input <-chan []update, close <-chan (interface{}), s *stats) {
 	heartbeat := time.Now()
 
 	state := make([]time.Time, len(r.members))
@@ -66,12 +115,15 @@ func member(r ring, index int, broadcastInterval, heartbeatInterval time.Duratio
 
 	var pending []update
 
-	bct := time.NewTicker(broadcastInterval)
-	hbt := time.NewTicker(heartbeatInterval)
+	bci := time.Duration(c.broadcastInterval) * time.Millisecond
+	bct := time.NewTicker(bci)
+	hbt := time.NewTicker(time.Duration(c.heartbeatInterval) * time.Millisecond)
 
 	received := 0
 
-	time.Sleep(time.Duration(rand.Intn(int(heartbeatInterval))))
+	sleep := time.Duration(rand.Intn(int(bci)))
+	//log.Printf("Sleeping %v", sleep)
+	time.Sleep(sleep)
 
 	for {
 		select {
@@ -81,16 +133,31 @@ func member(r ring, index int, broadcastInterval, heartbeatInterval time.Duratio
 
 			pending = append(pending, update{index, heartbeat})
 		case <-bct.C:
-			for bc := 0; bc < 6; bc++ {
+			if c.broadcastOldestFirst {
+				sort.Sort(updates(pending))
+			}
+
+			toSend := c.broadcastMessageLimit
+			if toSend > len(pending) || c.broadcastMessageLimit < 0 {
+				toSend = len(pending)
+			}
+
+			var batch []update
+			if c.broadcastOldestFirst {
+				batch = pending[:toSend]
+				pending = pending[toSend:]
+			} else {
+				cut := len(pending) - toSend
+				batch = pending[cut:]
+				pending = pending[:cut]
+			}
+
+			for bc := 0; bc < c.broadcastCount; bc++ {
 				target := rand.Intn(len(r.members))
-				r.members[target] <- pending
+				r.members[target] <- batch
 			}
 
-			if float64(len(pending)) > float64(len(r.members))*0.5 {
-				//log.Printf("%d: sent %d messages which is >0.5 of the number of members", index, len(pending))
-			}
-
-			s.sentInput <- len(pending)
+			s.sentInput <- len(batch)
 			s.receivedInput <- received
 
 			var maxDelay time.Duration
@@ -103,7 +170,9 @@ func member(r ring, index int, broadcastInterval, heartbeatInterval time.Duratio
 			}
 			s.delayInput <- int64(maxDelay / time.Millisecond)
 
+			orig := pending
 			pending = nil
+			pending = append(pending, orig...)
 			received = 0
 		case messages := <-input:
 			received += len(messages)
@@ -132,9 +201,9 @@ type stats struct {
 
 func newStats(members int) *stats {
 	return &stats{
-		received:      hdrhistogram.NewWindowed(5, 0, int64(members)*10, 3),
-		sent:          hdrhistogram.NewWindowed(5, 0, int64(members)*10, 3),
-		delay:         hdrhistogram.NewWindowed(5, 0, 20*(int64(time.Second)/int64(time.Millisecond)), 3),
+		received:      hdrhistogram.NewWindowed(2, 0, int64(members)*10, 3),
+		sent:          hdrhistogram.NewWindowed(2, 0, int64(members)*10, 3),
+		delay:         hdrhistogram.NewWindowed(2, 0, 60*(int64(time.Second)/int64(time.Millisecond)), 3),
 		receivedInput: make(chan int, members*5),
 		sentInput:     make(chan int, members*5),
 		delayInput:    make(chan int64, members*5),
@@ -142,7 +211,7 @@ func newStats(members int) *stats {
 }
 
 func (s *stats) dump() {
-	fmt.Println("RECEIVED: How many updates did we recieve between each time we sent a broacast?")
+	fmt.Println("RECEIVED: How many updates did we receive between each time we sent a broacast?")
 	s.received.Merge().PercentilesPrint(os.Stdout, 1, 1.0)
 
 	fmt.Println("\n\nSENT: How many updates did we send in each broadcast?")
@@ -170,7 +239,10 @@ func (s *stats) run(interval time.Duration) {
 		case c := <-s.receivedInput:
 			_ = s.received.Current.RecordValue(int64(c))
 		case d := <-s.delayInput:
-			_ = s.delay.Current.RecordValue(d)
+			err := s.delay.Current.RecordValue(d)
+			if err != nil {
+				_ = s.delay.Current.RecordValue(s.delay.Current.HighestTrackableValue())
+			}
 		}
 	}
 }
