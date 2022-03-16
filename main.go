@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"math/rand"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ type config struct {
 	broadcastInterval     int
 	heartbeatInterval     int
 	broadcastMessageLimit int
+	broadcastMult         int
 	broadcastOldestFirst  bool
 }
 
@@ -35,8 +37,14 @@ func main() {
 	flag.IntVar(&c.broadcastInterval, "broadcast-interval", 200, "ms between broadcasts")
 	flag.IntVar(&c.heartbeatInterval, "heartbeat-interval", 5000, "ms between heartbeats")
 	flag.BoolVar(&c.broadcastOldestFirst, "broadcast-oldest-first", false, "whether to send the oldest updates first")
-	flag.IntVar(&c.broadcastMessageLimit, "broadcast-message-limit", -1, "the number of messages allowed per broadcast. if below zero, no limit")
+	flag.IntVar(&c.broadcastMessageLimit, "broadcast-message-limit", -1, "the number of messages allowed per broadcast. if zero or below, no limit")
+	flag.IntVar(&c.broadcastMult, "broadcast-mult", -1, "sets the broadcast count akin to Hashicorp's memberlist RetransmitMult: mult * ceil(log10(members + 1)). if zero or below, inactive. this takes precedence over broadcast-count.")
 	flag.Parse()
+
+	if c.broadcastMult > 0 {
+		c.broadcastCount = retransmitLimit(c.broadcastMult, c.members)
+		log.Printf("Set broadcast-count to %d based on %d members and a mult of %d", c.broadcastCount, c.members, c.broadcastMult)
+	}
 
 	close := make(chan interface{})
 
@@ -63,6 +71,13 @@ func main() {
 	}()
 
 	wg.Wait()
+}
+
+// from Hashicorp's memberlist
+func retransmitLimit(retransmitMult, n int) int {
+	nodeScale := math.Ceil(math.Log10(float64(n + 1)))
+	limit := retransmitMult * int(nodeScale)
+	return limit
 }
 
 type update struct {
